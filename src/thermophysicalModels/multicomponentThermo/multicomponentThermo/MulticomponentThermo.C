@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2023-2025 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -23,510 +23,271 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-#include "MulticomponentThermo.H"
-#include "fvMesh.H"
+#include "multicomponentThermo.H"
+
+// * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+
+namespace Foam
+{
+    defineTypeNameAndDebug(multicomponentThermo, 0);
+}
+
 
 // * * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * * //
 
-template<class BaseThermo>
-template<class Method, class ... Args>
-Foam::tmp<Foam::volScalarField>
-Foam::MulticomponentThermo<BaseThermo>::volScalarFieldPropertyi
-(
-    const word& psiName,
-    const dimensionSet& psiDim,
-    Method psiMethod,
-    const label speciei,
-    const Args& ... args
-) const
+void Foam::multicomponentThermo::implementation::correctMassFractions()
 {
-    const typename BaseThermo::mixtureType::thermoType& thermo =
-        this->specieThermo(speciei);
-
-    tmp<volScalarField> tPsi
-    (
-        volScalarField::New
+    if (species_.size())
+    {
+        tmp<volScalarField> tYt
         (
-            IOobject::groupName(psiName, this->T_.group()),
-            this->T_.mesh(),
-            psiDim
-        )
-    );
+            volScalarField::New
+            (
+                IOobject::groupName("Yt", Y_[0].group()),
+                Y_[0],
+                calculatedFvPatchScalarField::typeName
+            )
+        );
+        volScalarField& Yt = tYt.ref();
 
-    volScalarField& psi = tPsi.ref();
-
-    forAll(psi, celli)
-    {
-        psi[celli] = (thermo.*psiMethod)(args[celli] ...);
-    }
-
-    volScalarField::Boundary& psiBf = psi.boundaryFieldRef();
-
-    forAll(psiBf, patchi)
-    {
-        forAll(psiBf[patchi], patchFacei)
+        for (label i=1; i<Y_.size(); i++)
         {
-            psiBf[patchi][patchFacei] =
-                (thermo.*psiMethod)
-                (
-                    args.boundaryField()[patchi][patchFacei] ...
-                );
+            Yt += Y_[i];
+        }
+
+        if (mag(min(Yt).value()) < rootVSmall)
+        {
+            FatalErrorInFunction
+                << "Sum of mass fractions is zero for species " << species()
+                << exit(FatalError);
+        }
+
+        forAll(Y_, i)
+        {
+            Y_[i] /= Yt;
         }
     }
-
-    return tPsi;
-}
-
-
-template<class BaseThermo>
-template<class Method, class ... Args>
-Foam::tmp<Foam::volScalarField::Internal>
-Foam::MulticomponentThermo<BaseThermo>::volInternalScalarFieldPropertyi
-(
-    const word& psiName,
-    const dimensionSet& psiDim,
-    Method psiMethod,
-    const label speciei,
-    const Args& ... args
-) const
-{
-    const typename BaseThermo::mixtureType::thermoType& thermo =
-        this->specieThermo(speciei);
-
-    tmp<volScalarField::Internal> tPsi
-    (
-        volScalarField::Internal::New
-        (
-            IOobject::groupName(psiName, this->T_.group()),
-            this->T_.mesh(),
-            psiDim
-        )
-    );
-
-    volScalarField::Internal& psi = tPsi.ref();
-
-    forAll(psi, celli)
-    {
-        psi[celli] = (thermo.*psiMethod)(args[celli] ...);
-    }
-
-    return tPsi;
-}
-
-
-template<class BaseThermo>
-template<class Method, class Arg, class ... Args>
-Foam::tmp<Foam::scalarField>
-Foam::MulticomponentThermo<BaseThermo>::scalarFieldPropertyi
-(
-    Method psiMethod,
-    const label speciei,
-    const Arg& arg,
-    const Args& ... args
-) const
-{
-    const typename BaseThermo::mixtureType::thermoType& thermo =
-        this->specieThermo(speciei);
-
-    tmp<scalarField> tPsi(new scalarField(arg.size()));
-
-    scalarField& psi = tPsi.ref();
-
-    forAll(psi, i)
-    {
-        psi[i] = (thermo.*psiMethod)(arg[i], args[i] ...);
-    }
-
-    return tPsi;
 }
 
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
-template<class BaseThermo>
-Foam::MulticomponentThermo<BaseThermo>::MulticomponentThermo
+Foam::multicomponentThermo::implementation::implementation
 (
+    const dictionary& dict,
+    const wordList& specieNames,
     const fvMesh& mesh,
     const word& phaseName
 )
 :
-    BaseThermo(mesh, phaseName)
-{}
+    species_(specieNames),
+    defaultSpecieName_
+    (
+        species_.size()
+      ? dict.lookupBackwardsCompatible<word>
+        (
+            {"defaultSpecie", "inertSpecie"}
+        )
+      : word("undefined")
+    ),
+    defaultSpeciei_
+    (
+        species_.size()
+     && species_.found(defaultSpecieName_)
+      ? species_[defaultSpecieName_]
+      : -1
+    ),
+    active_(species_.size(), true),
+    Y_(species_.size())
+{
+    if (species_.size() && defaultSpeciei_ == -1)
+    {
+        FatalIOErrorInFunction(dict)
+            << "default specie " << defaultSpecieName_
+            << " not found in available species " << species_
+            << exit(FatalIOError);
+    }
+
+    // Read the species' mass fractions
+    forAll(species_, i)
+    {
+        typeIOobject<volScalarField> header
+        (
+            IOobject::groupName(species_[i], phaseName),
+            mesh.time().name(),
+            mesh,
+            IOobject::NO_READ
+        );
+
+        if (header.headerOk())
+        {
+            // Read the mass fraction field
+            Y_.set
+            (
+                i,
+                new volScalarField
+                (
+                    IOobject
+                    (
+                        IOobject::groupName(species_[i], phaseName),
+                        mesh.time().name(),
+                        mesh,
+                        IOobject::MUST_READ,
+                        IOobject::AUTO_WRITE
+                    ),
+                    mesh
+                )
+            );
+        }
+        else
+        {
+            // Read Ydefault if not already read
+            if (!Ydefault_.valid())
+            {
+                Ydefault_ = new volScalarField
+                (
+                    IOobject
+                    (
+                        IOobject::groupName("Ydefault", phaseName),
+                        mesh.time().name(),
+                        mesh,
+                        IOobject::MUST_READ,
+                        IOobject::NO_WRITE
+                    ),
+                    mesh
+                );
+            }
+
+            Y_.set
+            (
+                i,
+                new volScalarField
+                (
+                    IOobject
+                    (
+                        IOobject::groupName(species_[i], phaseName),
+                        mesh.time().name(),
+                        mesh,
+                        IOobject::NO_READ,
+                        IOobject::AUTO_WRITE
+                    ),
+                    Ydefault_()
+                )
+            );
+        }
+    }
+
+    correctMassFractions();
+}
 
 
 // * * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * //
 
-template<class BaseThermo>
-Foam::MulticomponentThermo<BaseThermo>::~MulticomponentThermo()
+Foam::multicomponentThermo::~multicomponentThermo()
+{}
+
+
+Foam::multicomponentThermo::implementation::~implementation()
 {}
 
 
 // * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
 
-template<class BaseThermo>
-Foam::scalar Foam::MulticomponentThermo<BaseThermo>::WiValue
-(
-    const label speciei
-) const
+const Foam::speciesTable&
+Foam::multicomponentThermo::implementation::species() const
 {
-    return this->specieThermo(speciei).W();
+    return species_;
 }
 
 
-template<class BaseThermo>
-Foam::dimensionedScalar Foam::MulticomponentThermo<BaseThermo>::Wi
-(
-    const label speciei
-) const
+Foam::label Foam::multicomponentThermo::implementation::defaultSpecie() const
 {
-    return
-        dimensionedScalar
+    return defaultSpeciei_;
+}
+
+
+const Foam::List<bool>&
+Foam::multicomponentThermo::implementation::speciesActive() const
+{
+    return active_;
+}
+
+
+void Foam::multicomponentThermo::implementation::syncSpeciesActive() const
+{
+    if (Pstream::parRun())
+    {
+        List<bool>& speciesActive =
+            const_cast<List<bool>&>(this->speciesActive());
+
+        Pstream::listCombineGather(speciesActive, orEqOp<bool>());
+        Pstream::listCombineScatter(speciesActive);
+
+        PtrList<volScalarField>& Y =
+            const_cast<PtrList<volScalarField>&>(this->Y());
+
+        forAll(Y, speciei)
+        {
+            if (speciesActive[speciei])
+            {
+                Y[speciei].writeOpt() = IOobject::AUTO_WRITE;
+            }
+        }
+    }
+
+    if (Ydefault_.valid())
+    {
+        Ydefault_->writeOpt() = IOobject::AUTO_WRITE;
+    }
+}
+
+
+Foam::PtrList<Foam::volScalarField>&
+Foam::multicomponentThermo::implementation::Y()
+{
+    return Y_;
+}
+
+
+const Foam::PtrList<Foam::volScalarField>&
+Foam::multicomponentThermo::implementation::Y() const
+{
+    return Y_;
+}
+
+
+void Foam::multicomponentThermo::implementation::normaliseY()
+{
+    if (species().size())
+    {
+        tmp<volScalarField> tYt
         (
-            "W",
-            dimMass/dimMoles,
-            this->specieThermo(speciei).W()
+            volScalarField::New
+            (
+                IOobject::groupName("Yt", phaseName()),
+                Y()[0].mesh(),
+                dimensionedScalar(dimless, 0)
+            )
         );
-}
+        volScalarField& Yt = tYt.ref();
 
+        forAll(Y(), i)
+        {
+            if (solveSpecie(i))
+            {
+                Y()[i].max(scalar(0));
+                Yt += Y()[i];
+            }
+        }
 
-template<class BaseThermo>
-Foam::scalar Foam::MulticomponentThermo<BaseThermo>::rhoi
-(
-    const label speciei,
-    const scalar p,
-    const scalar T
-) const
-{
-    return this->specieThermo(speciei).rho(p, T);
-}
+        Y()[defaultSpecie()] = scalar(1) - Yt;
+        Y()[defaultSpecie()].max(scalar(0));
+    }
 
-
-template<class BaseThermo>
-Foam::tmp<Foam::volScalarField>
-Foam::MulticomponentThermo<BaseThermo>::rhoi
-(
-    const label speciei,
-    const volScalarField& p,
-    const volScalarField& T
-) const
-{
-    return volScalarFieldPropertyi
-    (
-        "rho",
-        dimDensity,
-        &BaseThermo::mixtureType::thermoType::rho,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::scalar Foam::MulticomponentThermo<BaseThermo>::Cpi
-(
-    const label speciei,
-    const scalar p,
-    const scalar T
-) const
-{
-    return this->specieThermo(speciei).Cp(p, T);
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::volScalarField>
-Foam::MulticomponentThermo<BaseThermo>::Cpi
-(
-    const label speciei,
-    const volScalarField& p,
-    const volScalarField& T
-) const
-{
-    return volScalarFieldPropertyi
-    (
-        "Cp",
-        dimEnergy/dimMass/dimTemperature,
-        &BaseThermo::mixtureType::thermoType::Cp,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::scalar Foam::MulticomponentThermo<BaseThermo>::hei
-(
-    const label speciei,
-    const scalar p,
-    const scalar T
-) const
-{
-    return this->specieThermo(speciei).he(p, T);
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::scalarField> Foam::MulticomponentThermo<BaseThermo>::hei
-(
-    const label speciei,
-    const scalarField& p,
-    const scalarField& T
-) const
-{
-    return scalarFieldPropertyi
-    (
-        &BaseThermo::mixtureType::thermoType::he,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::volScalarField::Internal>
-Foam::MulticomponentThermo<BaseThermo>::hei
-(
-    const label speciei,
-    const volScalarField::Internal& p,
-    const volScalarField::Internal& T
-) const
-{
-    return volInternalScalarFieldPropertyi
-    (
-        "he",
-        dimEnergy/dimMass,
-        &BaseThermo::mixtureType::thermoType::he,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::volScalarField>
-Foam::MulticomponentThermo<BaseThermo>::hei
-(
-    const label speciei,
-    const volScalarField& p,
-    const volScalarField& T
-) const
-{
-    return volScalarFieldPropertyi
-    (
-        "he",
-        dimEnergy/dimMass,
-        &BaseThermo::mixtureType::thermoType::he,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::scalar Foam::MulticomponentThermo<BaseThermo>::hsi
-(
-    const label speciei,
-    const scalar p,
-    const scalar T
-) const
-{
-    return this->specieThermo(speciei).hs(p, T);
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::scalarField> Foam::MulticomponentThermo<BaseThermo>::hsi
-(
-    const label speciei,
-    const scalarField& p,
-    const scalarField& T
-) const
-{
-    return scalarFieldPropertyi
-    (
-        &BaseThermo::mixtureType::thermoType::hs,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::volScalarField::Internal>
-Foam::MulticomponentThermo<BaseThermo>::hsi
-(
-    const label speciei,
-    const volScalarField::Internal& p,
-    const volScalarField::Internal& T
-) const
-{
-    return volInternalScalarFieldPropertyi
-    (
-        "hs",
-        dimEnergy/dimMass,
-        &BaseThermo::mixtureType::thermoType::hs,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::volScalarField>
-Foam::MulticomponentThermo<BaseThermo>::hsi
-(
-    const label speciei,
-    const volScalarField& p,
-    const volScalarField& T
-) const
-{
-    return volScalarFieldPropertyi
-    (
-        "hs",
-        dimEnergy/dimMass,
-        &BaseThermo::mixtureType::thermoType::hs,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::scalar Foam::MulticomponentThermo<BaseThermo>::hai
-(
-    const label speciei,
-    const scalar p,
-    const scalar T
-) const
-{
-    return this->specieThermo(speciei).ha(p, T);
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::scalarField> Foam::MulticomponentThermo<BaseThermo>::hai
-(
-    const label speciei,
-    const scalarField& p,
-    const scalarField& T
-) const
-{
-    return scalarFieldPropertyi
-    (
-        &BaseThermo::mixtureType::thermoType::ha,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::volScalarField::Internal>
-Foam::MulticomponentThermo<BaseThermo>::hai
-(
-    const label speciei,
-    const volScalarField::Internal& p,
-    const volScalarField::Internal& T
-) const
-{
-    return volInternalScalarFieldPropertyi
-    (
-        "ha",
-        dimEnergy/dimMass,
-        &BaseThermo::mixtureType::thermoType::ha,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::volScalarField>
-Foam::MulticomponentThermo<BaseThermo>::hai
-(
-    const label speciei,
-    const volScalarField& p,
-    const volScalarField& T
-) const
-{
-    return volScalarFieldPropertyi
-    (
-        "ha",
-        dimEnergy/dimMass,
-        &BaseThermo::mixtureType::thermoType::ha,
-        speciei,
-        p,
-        T
-    );
-}
-
-
-template<class BaseThermo>
-Foam::dimensionedScalar Foam::MulticomponentThermo<BaseThermo>::hfi
-(
-    const label speciei
-) const
-{
-    return
-        dimensionedScalar
-        (
-            "hf",
-            dimEnergy/dimMass,
-            this->specieThermo(speciei).hf()
-        );
-}
-
-
-template<class BaseThermo>
-Foam::scalar Foam::MulticomponentThermo<BaseThermo>::hfiValue
-(
-    const label speciei
-) const
-{
-    return this->specieThermo(speciei).hf();
-}
-
-
-template<class BaseThermo>
-Foam::scalar Foam::MulticomponentThermo<BaseThermo>::kappai
-(
-    const label speciei,
-    const scalar p,
-    const scalar T
-) const
-{
-    return this->specieThermo(speciei).kappa(p, T);
-}
-
-
-template<class BaseThermo>
-Foam::tmp<Foam::volScalarField>
-Foam::MulticomponentThermo<BaseThermo>::kappai
-(
-    const label speciei,
-    const volScalarField& p,
-    const volScalarField& T
-) const
-{
-    return volScalarFieldPropertyi
-    (
-        "kappa",
-        dimThermalConductivity,
-        &BaseThermo::mixtureType::thermoType::kappa,
-        speciei,
-        p,
-        T
-    );
+    if (Ydefault_.valid() && Ydefault_->writeOpt() == IOobject::NO_WRITE)
+    {
+        Ydefault_.clear();
+    }
 }
 
 

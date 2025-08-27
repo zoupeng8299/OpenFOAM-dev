@@ -23,38 +23,166 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-#include "PatchIntersection.H"
+#include "patchIntersection.H"
 #include "primitivePatch.H"
 #include "vtkWritePolyData.H"
 
+// * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+
+const bool Foam::patchIntersection::orientToSource_ = true;
+
+namespace Foam
+{
+    defineTypeNameAndDebug(patchIntersection, 0);
+}
+
+
+// * * * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * //
+
+void Foam::patchIntersection::report(const word& writeSuffix)
+{
+    {
+        const primitivePatch patch
+        (
+            SubList<face>(faces_, faces_.size()),
+            points_
+        );
+
+        scalar area = 0, srcArea = 0, tgtArea = 0;
+        forAll(faces_, facei)
+        {
+            const scalar a = faces_[facei].mag(points_);
+            area += a;
+            srcArea += faceSrcFaces_[facei] != -1 ? a : 0;
+            tgtArea += faceTgtFaces_[facei] != -1 ? a : 0;
+        }
+        Info<< indent << "Source/target coverage = " << srcArea/area
+            << "/" << tgtArea/area << endl;
+
+        DynamicList<label> nEdgesNFaces, nFacesNEdges;
+        forAll(faces_, facei)
+        {
+            const label n = faces_[facei].size();
+            nEdgesNFaces.resize(max(nEdgesNFaces.size(), n + 1), 0);
+            ++ nEdgesNFaces[n];
+        }
+        forAll(patch.edgeFaces(), edgei)
+        {
+            const label n = patch.edgeFaces()[edgei].size();
+            nFacesNEdges.resize(max(nFacesNEdges.size(), n + 1), 0);
+            ++ nFacesNEdges[n];
+        }
+        Info<< indent << "Faces by number of edges = (";
+        forAll(nEdgesNFaces, n)
+        {
+            Info<< (n ? " " : "") << nEdgesNFaces[n];
+        }
+        Info<< ")" << endl << indent << "Edges by number of faces = (";
+        forAll(nFacesNEdges, n)
+        {
+            Info<< (n ? " " : "") << nFacesNEdges[n];
+        }
+        Info<< ")" << endl;
+    }
+
+    if (debug)
+    {
+        Info<< indent << "Writing intersected patch" << incrIndent << endl;
+
+        const fileName patchFileName =
+            type() + "_patch" + (writeSuffix.empty() ? "" : "_")
+          + writeSuffix + ".vtk";
+        Info<< indent << "Writing patch to " << patchFileName << endl;
+        vtkWritePolyData::write
+        (
+            patchFileName,
+            "intersectedPatch",
+            false,
+            points_,
+            labelList(),
+            labelListList(),
+            faces_,
+            "srcFace",
+            false,
+            labelField(faceSrcFaces_),
+            "tgtFace",
+            false,
+            labelField(faceTgtFaces_)
+        );
+
+        const fileName patchEdgesFileName =
+            type() + "_patchEdges" + (writeSuffix.empty() ? "" : "_")
+          + writeSuffix + ".vtk";
+        Info<< indent << "Writing patch edges to " << patchEdgesFileName
+            << endl;
+        const primitivePatch patch
+        (
+            SubList<face>(faces_, faces_.size()),
+            points_
+        );
+        labelField edgeNFaces(patch.nEdges());
+        forAll(patch.edgeFaces(), edgei)
+        {
+            edgeNFaces[edgei] = patch.edgeFaces()[edgei].size();
+        }
+        vtkWritePolyData::write
+        (
+            patchEdgesFileName,
+            "intersectedPatchEdges",
+            false,
+            patch.localPoints(),
+            labelList(),
+            patch.edges(),
+            faceList(),
+            "nFaces",
+            false,
+            edgeNFaces
+        );
+
+        Info<< decrIndent;
+    }
+}
+
+
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
-template<class SrcPatchType, class TgtPatchType>
-Foam::PatchIntersection<SrcPatchType, TgtPatchType>::PatchIntersection
+Foam::patchIntersection::patchIntersection
 (
-    const SrcPatchType& srcPatch,
-    const TgtPatchType& tgtPatch
+    const label srcNPoints,
+    const label tgtNPoints,
+    const label srcNEdges,
+    const label tgtNEdges,
+    const label srcNFaces,
+    const label tgtNFaces
 )
 :
-    patchIntersection
-    (
-        srcPatch.nPoints(),
-        tgtPatch.nPoints(),
-        srcPatch.nEdges(),
-        tgtPatch.nEdges(),
-        srcPatch.size(),
-        tgtPatch.size()
-    ),
+    points_(),
 
-    srcPatch_(srcPatch),
-    tgtPatch_(tgtPatch)
+    srcPointPoints_(srcNPoints),
+    tgtPointPoints_(tgtNPoints),
+    pointSrcPoints_(),
+    pointTgtPoints_(),
+
+    srcEdgePoints_(srcNEdges),
+    tgtEdgePoints_(tgtNEdges),
+    pointSrcEdges_(),
+    pointTgtEdges_(),
+
+    pointSrcFaces_(),
+    pointTgtFaces_(),
+
+    faces_(),
+
+    srcFaceFaces_(srcNFaces),
+    tgtFaceFaces_(tgtNFaces),
+    faceSrcFaces_(),
+    faceTgtFaces_()
 {}
 
 
 // * * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * //
 
-template<class SrcPatchType, class TgtPatchType>
-Foam::PatchIntersection<SrcPatchType, TgtPatchType>::~PatchIntersection()
+Foam::patchIntersection::~patchIntersection()
 {}
 
 
